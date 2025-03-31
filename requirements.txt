@@ -1,0 +1,11 @@
+numpy
+requests
+scipy
+pyaudio
+SpeechRecognition
+webrtcvad
+sounddevice
+soundfile
+transliterate
+git+https://github.com/Badim41/DiscordUserAPI.git
+git+https://github.com/Badim41/network_tools.git
