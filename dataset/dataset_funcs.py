@@ -1,6 +1,16 @@
+import hashlib
 import json
 import os
 import re
+import subprocess
+import uuid
+
+import magic
+import requests
+from PIL import Image
+from discord_user.utils.re_str import extract_discord_emojis
+
+
 def split_text_by_sentences(text, min_size=5000, max_size=6000):
     # Регулярное выражение для поиска предложений (основное для английского текста)
     sentence_endings = re.compile(r'([.!?])')
@@ -175,3 +185,118 @@ def parse_to_json(text):
 #     # Опционально: сохранение в файл
 #     with open('output.json', 'w', encoding='utf-8') as f:
 #         json.dump(result, f, ensure_ascii=False, indent=4)
+
+def get_mime_type_from_content(file_path):
+    try:
+        mime = magic.Magic(mime=True)
+        mime_type = mime.from_file(file_path)
+        return mime_type
+    except Exception as e:
+        print(f"Error detecting MIME type with python-magic: {e}")
+        return None
+
+def download_content(url, output_file, attempts=10):
+    for i in range(attempts):
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+
+            with open(output_file, 'wb') as file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        file.write(chunk)
+            # Определяем MIME-тип по содержимому файла
+            mime_type = get_mime_type_from_content(output_file)
+            return True, mime_type or 'image/NotFound'
+        except Exception as e:
+            print(f"Temp error in download: {e}")
+    return False, None
+
+def convert_image_to_png(input_file, output_file):
+    try:
+        with Image.open(input_file) as img:
+            img.convert("RGBA").save(output_file, "PNG")
+        return True
+    except Exception as e:
+        print(f"Error converting image to PNG: {e}")
+        return False
+
+
+def extract_first_frame_from_gif(input_file, output_file):
+    try:
+        with Image.open(input_file) as img:
+            # Extract the first frame from the GIF
+            img.seek(0)
+            img.save(output_file, "PNG")
+        return True
+    except Exception as e:
+        print(f"Error extracting frame from GIF: {e}")
+        return False
+
+
+def extract_first_frame_from_video(video_url, output_file):
+    try:
+        # Build the ffmpeg command to extract the first frame from the video
+        command = [
+            'ffmpeg',
+            '-i', video_url,  # Input file (video URL or path)
+            '-ss', '00:00:01',  # Seek to 1 second to ensure we get a frame
+            '-vframes', '1',  # Extract only 1 frame
+            output_file  # Output file (image path)
+        ]
+
+        # Execute the command
+        subprocess.run(command, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error extracting frame from video: {e}")
+        return False
+
+def download_image_path_from_message(file_name, message_json):  # Изменено с message на message_json
+    os.makedirs('images', exist_ok=True)
+    emojies_in_message = extract_discord_emojis(message_json['content'])  # Изменено message.text на message_json['content']
+
+    attachment_urls = []
+
+    if message_json.get('attachments'):  # Изменено message.attachments на message_json['attachments']
+        attachment_urls = [attachment['url'] for attachment in message_json['attachments']]
+
+    print("attachment_urls", attachment_urls)
+    for url in attachment_urls:
+        # Download the content
+        temp_output_path = f"images/{file_name}.tmp"
+        success, mime_type = download_content(url, temp_output_path)
+        if success:
+            # Get the mime type
+            print("mime_type", mime_type)
+
+            if mime_type:
+                if 'image' in mime_type:
+                    if 'webp' in mime_type:
+                        output_path = f"images/{file_name}.png"
+                        if convert_image_to_png(temp_output_path, output_path):
+                            return output_path
+                    else:
+                        output_path = f"images/{file_name}.png"
+                        if convert_image_to_png(temp_output_path, output_path):
+                            return output_path
+
+    return None  # Return None if no media could be retrieved
+
+
+def get_hash(input_string: str, algorithm: str = 'sha256') -> str:
+    """
+    Получает хэш строки с использованием заданного алгоритма.
+
+    :param input_string: Строка для хэширования.
+    :param algorithm: Алгоритм хэширования ('sha256', 'md5', 'sha1' и т.д.).
+    :return: Хэш строки в виде шестнадцатеричной строки.
+    """
+    try:
+        hash_function = getattr(hashlib, algorithm)
+    except AttributeError:
+        raise ValueError(
+            f"Алгоритм '{algorithm}' не поддерживается. Используйте один из {', '.join(hashlib.algorithms_guaranteed)}.")
+
+    hash_object = hash_function(input_string.encode('utf-8'))
+    return hash_object.hexdigest()

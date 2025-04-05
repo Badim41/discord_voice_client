@@ -7,7 +7,7 @@ import secret
 from base_classes import embedding_tools, network_client, discord_client, sql_database, event_manager
 from event_manager import EventTypeForManager
 from ds_user import activate_handlers
-from functions import format_messages, save_answer_to_history
+from functions import format_messages, save_answer_to_history, remove_emojis
 from record import AudioProcessor
 from tts_tools import TTSQueue, tts_audio_with_play
 from base_logger import Logs
@@ -55,7 +55,7 @@ def on_speak_text_thread(text: str):
 
 
 def on_speak_text(text: str, stop_event: threading.Event):
-    sql_database['time_stop_playing'] = time.time()
+    # sql_database['time_stop_playing'] = time.time()
     print("on_speak_text", text)
 
     # Проверяем флаг прерывания перед началом длительных операций
@@ -88,7 +88,8 @@ def on_speak_text(text: str, stop_event: threading.Event):
 
     full_prompt = (
         f"# Задача\n"
-        f"{system_prompt}\n\n"
+        f"{system_prompt}\n"
+        f"Твоя речь будет преобразована в голос, так что вставляй разговорные слова и связки: 'Оо..', 'Хмм..', 'Ааа..'\n\n"
         f"{events_text}\n\n"
         f"{memories_character}\n\n"
         f"# История сообщений\n"
@@ -107,7 +108,7 @@ def on_speak_text(text: str, stop_event: threading.Event):
         print("Thread interrupted during GPT response")
         return
 
-    response_text = answer_gpt.response.text
+    response_text = remove_emojis(answer_gpt.response.text)
 
     chat_history = save_answer_to_history(
         chat_history=chat_history,
@@ -127,7 +128,8 @@ def on_speak_text(text: str, stop_event: threading.Event):
         speed=speed,
         lang=lang,
         voice_id=voice_id,
-        model_id=model_id
+        model_id=model_id,
+        stop_event=stop_event
     )
 
     # Удаляем завершившийся поток из списка активных
@@ -143,7 +145,7 @@ if __name__ == "__main__":
         sql_database['chat_history_voice'] = []
         sql_database['chat_history_chat'] = []
 
-    processor = AudioProcessor(input_device_name=secret.device_input)
+    processor = AudioProcessor(input_device_name=secret.device_input, embedding_tools=embedding_tools)
     threading.Thread(target=processor.recognize_audio, args=(on_speak_text_thread,)).start()
     threading.Thread(target=processor.record_audio).start()
 

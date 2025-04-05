@@ -1,10 +1,15 @@
 import multiprocessing
+import random
+import string
+import threading
 import time
+import uuid
 
 import numpy as np
 import pyaudio
 import speech_recognition as sr
 import webrtcvad
+from functions import random_string
 
 import secret
 from base_classes import sql_database
@@ -18,7 +23,7 @@ logger = Logs(warnings=recognize_extra_logs, name="record")
 
 
 class AudioProcessor:
-    def __init__(self, input_device_name=None):
+    def __init__(self, input_device_name=None, embedding_tools=None):
         self.audio_queue = multiprocessing.Queue()
         self.CHUNK = 480  # 30 мс при 16000 Гц (480 сэмплов = 0.03 секунды при 16000 Гц)
         self.FORMAT = pyaudio.paInt16
@@ -26,6 +31,9 @@ class AudioProcessor:
         self.SILENCE_DURATION = secret.silence_duration  # Длительность паузы в секундах
         self.STOP_ON_SPEECH_DURATION = secret.stop_on_speech_duration  # длительность речи, после которой прекратится TTS
         self.input_device_name = input_device_name
+
+        self.embedding_tools = embedding_tools
+        self.embedding_interval = secret.embedding_interval
 
     def stereo_to_mono(self, data):
         """Преобразование стерео в моно."""
@@ -99,6 +107,8 @@ class AudioProcessor:
         speech_duration_threshold = int(
             self.RATE / self.CHUNK * self.STOP_ON_SPEECH_DURATION)  # 2 секунды в блоках (66.67 блоков при 30 мс)
 
+        last_embedding_time = 0  # Время последнего запроса embedding
+
         while True:
             try:
                 data = stream.read(self.CHUNK)
@@ -115,12 +125,25 @@ class AudioProcessor:
                         sql_database['time_stop_playing'] = time.time()
                         logger.logging(
                             f"Речь длительностью {self.STOP_ON_SPEECH_DURATION} секунды обнаружена, остановка воспроизведения")
+
+                        # подгружаем embedding модель. Так она даёт ответ быстрее
+                        current_time = time.time()
+                        if current_time - last_embedding_time >= self.embedding_interval and self.embedding_tools:
+                            # Генерируем случайную строку
+                            random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+                            # Запуск в отдельном потоке с правильной передачей аргумента
+                            threading.Thread(
+                                target=self.embedding_tools.get_embedding,
+                                args=(random_str,),  # Передаем как кортеж с одним элементом
+                            ).start()
+                            last_embedding_time = current_time
                 else:  # Тишина
                     frames.append(data)
                     silent_chunks += 1
                     speech_chunks = 0  # Сбрасываем счетчик речи при тишине
                     if silent_chunks >= silence_threshold and frames:  # Достигнута пауза и есть данные
                         audio_data = b''.join(frames)
+                        logger.logging("Put voice data")
                         self.audio_queue.put(sr.AudioData(audio_data, self.RATE, 2))
                         frames = []
                         silent_chunks = 0
@@ -138,9 +161,12 @@ class AudioProcessor:
         recognizer = sr.Recognizer()
         while True:
             try:
+                logger.logging("Getting voice data...")
                 audio_data = self.audio_queue.get(timeout=1)
                 if audio_data is None:
-                    break
+                    logger.logging("Data is None!")
+                    continue
+
                 logger.logging("start recognize")
                 text = recognizer.recognize_google(audio_data, language=recognize_lang)
                 logger.logging(f"recognized: {text}")

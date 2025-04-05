@@ -6,6 +6,7 @@ from typing import List, Union
 
 import numpy as np
 import requests
+from network_tools import NetworkToolsAPI
 from requests import RequestException
 from requests.adapters import HTTPAdapter
 from scipy.spatial.distance import cosine
@@ -13,15 +14,20 @@ from urllib3.util.retry import Retry
 
 import secret
 from base_logger import Logs
-from functions import Time_Count
+from functions import convert_answer_to_json
 
 logger = Logs(warnings=True, name="embedding-tools")
 
+search_dataset_prompt = secret.search_dataset_prompt
+search_dataset_model = secret.search_dataset_model
+
 
 class EmbeddingTools:
-    def __init__(self, cohere_api_key, dataset_folder, proxies=None):
+    def __init__(self, cohere_api_keys: list, dataset_folder, proxies=None, network_client: NetworkToolsAPI = None):
         """Инициализация с токеном HF и папкой для поиска"""
-        self.cohere_api_key = cohere_api_key
+        self.cohere_api_keys = cohere_api_keys
+        self._all_cohere_api_keys: list = cohere_api_keys
+        self.network_client = network_client
         self.dataset_folder = dataset_folder
         self.dataset_json_folder = os.path.join(self.dataset_folder, "dataset_json")
         self.dataset_embeddings_folder = os.path.join(self.dataset_folder, "dataset_embeddings")
@@ -35,31 +41,58 @@ class EmbeddingTools:
 
     @lru_cache(maxsize=10 ** 5)
     def get_embedding(
-            self, text: Union[str, List[str]],
+            self,
+            text: Union[str, List[str]],
             model: str = "embed-english-v3.0",
             input_type: str = "classification",
             embedding_type: str = "float",
-            max_retries=6,
-            timeout=60
+            max_retries: int = 45,
+            base_delay: float = 1.0
     ) -> List[float]:
         """
-        Генерация эмбеддинга через Cohere API v2/embed с обработкой лимитов
+        Генерация эмбеддинга через Cohere API v2/embed с улучшенной обработкой лимитов и ошибок.
 
         Args:
             text: Текст или список текстов для получения эмбеддингов
-            model: Название модели (по умолчанию embed-english-v3.0)
+            model: Название модели
             input_type: Тип ввода (search_document, search_query, classification, clustering, image)
             embedding_type: Тип возвращаемых эмбеддингов (float, int8, uint8, binary, ubinary)
+            max_retries: Максимальное количество попыток
+            base_delay: Базовая задержка между повторными попытками в секундах
 
         Returns:
             Список чисел с плавающей точкой представляющих эмбеддинг
 
         Raises:
-            requests.exceptions.RequestException: Ошибка при запросе к API после всех попыток
+            ValueError: Некорректные входные параметры
+            RequestException: Ошибка при запросе к API после всех попыток
+            Exception: Отсутствуют API ключи
         """
-        timer = Time_Count()  # Предполагается, что у вас есть такой класс
 
-        # Формируем тело запроса
+        def _handle_rate_limit(response_text: str, attempt: int, base_delay: float, api_key: str,
+                               current_keys: list) -> float:
+            """Обработка различных типов ограничений скорости."""
+            if "calls / minute" in response_text:
+                return 20.0
+            elif "Please wait and try again later" in response_text:
+                return 10.0
+            elif "1000 API calls / month" in response_text:
+                # Удаляем ключ навсегда
+                if api_key in self._all_cohere_api_keys:
+                    logger.logging(f"removed: {api_key}")
+                    self._all_cohere_api_keys.remove(api_key)
+                if api_key in current_keys:
+                    current_keys.remove(api_key)
+                return None  # Сигнализируем, что ключ удалён и нужно продолжить с новым
+            return base_delay * (attempt + 1)
+
+        # Валидация входных параметров
+        if not text:
+            raise ValueError("Text parameter cannot be empty")
+        if not self.cohere_api_keys and not self._all_cohere_api_keys:
+            raise Exception("No Cohere API keys available")
+
+        # Подготовка запроса
         payload = {
             "model": model,
             "texts": [text] if isinstance(text, str) else text,
@@ -67,52 +100,60 @@ class EmbeddingTools:
             "embedding_types": [embedding_type]
         }
 
-        # Настраиваем заголовки
-        headers = {
+        headers_template = {
             "accept": "application/json",
-            "content-type": "application/json",
-            "Authorization": f"bearer {self.cohere_api_key}"
+            "content-type": "application/json"
         }
 
-        base_delay = 2  # базовая задержка в секундах
+        start_time = time.time()
+        current_keys = self.cohere_api_keys or self._all_cohere_api_keys
 
         for attempt in range(max_retries):
+            if not current_keys:
+                print(f"No keys. Update: {self._all_cohere_api_keys}")
+                current_keys = self._all_cohere_api_keys
+                if not current_keys:
+                    raise Exception("All Cohere API keys exhausted")
+
+            api_key = current_keys[0]
+            print(f"use: {api_key}")
+            headers = {**headers_template, "Authorization": f"bearer {api_key}"}
+
             try:
-                # Отправляем запрос
                 response = self.req_session.post(
                     "https://api.cohere.com/v2/embed",
                     json=payload,
-                    headers=headers,
-                    timeout=timeout
+                    headers=headers
                 )
+                status_code = response.status_code
+                if status_code == 429:  # Rate limit
+                    delay = _handle_rate_limit(response.text, attempt, base_delay, api_key, current_keys)
+                    if delay is None:  # Ключ был удалён из-за лимита 1000 вызовов в месяц
+                        continue
+                    print(f"Слишком много запросов. Ждём {delay} с")
+                    time.sleep(delay)
+                    continue
+                elif status_code == 401:  # Unauthorized
+                    if api_key in self._all_cohere_api_keys:
+                        logger.logging(f"removed: {api_key}")
+                        self._all_cohere_api_keys.remove(api_key)
+                    current_keys.pop(0)
+                    continue
                 response.raise_for_status()
-
-                # Получаем результат
                 result = response.json()
                 embeddings = result["embeddings"][embedding_type][0]
 
-                logger.logging(f"Получен embedding: {timer.count_time()}")
+                logger.logging(f"Получен эмбеддинг: {time.time() - start_time:.2f}s")
                 return embeddings
 
-            except RequestException as e:
-                if isinstance(e, requests.exceptions.Timeout):
-                    logger.logging(f"Таймаут при запросе после {attempt + 1} попытки, завершаем")
-                    break
-                if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 429:
-                    if attempt == max_retries - 1:  # Последняя попытка
-                        logger.logging(f"Исчерпаны все попытки ({max_retries}) для получения эмбеддинга: {str(e)}")
-                        break
-                    # Экспоненциальная задержка: base_delay * (2 ^ attempt)
-                    wait_time = base_delay * (2 ** attempt)
-                    logger.logging(f"Получен 429, попытка {attempt + 1}/{max_retries}, ждем {wait_time} сек")
-                    time.sleep(wait_time)
-                else:
-                    logger.logging(f"Ошибка при получении эмбеддинга: {str(e)}")
-                    break
+            except Exception as e:
+                logger.logging(f"Request failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
 
-        # Этот код не должен быть достигнут из-за raise в последней попытке,
-        # но добавлен для полноты
-        raise RequestException("Не удалось получить эмбеддинг после всех попыток")
+            current_keys = current_keys[1:] or self._all_cohere_api_keys
+
+        raise RequestException(f"Failed to get embedding after {max_retries} attempts")
 
     def process_json_file(self, file_path):
         """Обрабатывает один JSON-файл и добавляет недостающие эмбеддинги"""
@@ -184,6 +225,54 @@ class EmbeddingTools:
                 with open(output_file_path, 'w', encoding='utf-8') as f:
                     json.dump(processed_data, f, ensure_ascii=False, indent=2)
 
+    def remove_question_from_header(self, json_filename: str, question_text: str):
+        """Удаляет вопрос по тексту из всех тем указанного JSON (и в dataset_json, и в dataset_embeddings)"""
+        json_path = os.path.join(self.dataset_json_folder, json_filename)
+        embed_path = os.path.join(self.dataset_embeddings_folder, json_filename)
+
+        # === Удаление из dataset_json ===
+        if os.path.exists(json_path):
+            with open(json_path, 'r', encoding='utf-8') as f:
+                json_data = json.load(f)
+
+            modified = False
+            for header, qa_list in json_data.items():
+                new_qa_list = [qa for qa in qa_list if question_text not in qa]
+                if len(new_qa_list) != len(qa_list):
+                    json_data[header] = new_qa_list
+                    modified = True
+
+            if modified:
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+
+        else:
+            logger.logging(f"Файл не найден: {json_path}")
+
+        # === Удаление из dataset_embeddings ===
+        if os.path.exists(embed_path):
+            with open(embed_path, 'r', encoding='utf-8') as f:
+                embed_data = json.load(f)
+
+            modified = False
+            for header, items in embed_data.items():
+                new_items = [items[0]]  # Сохраняем первый элемент — эмбеддинг заголовка
+                changed = False
+                for item in items[1:]:
+                    if item.get("question") != question_text:
+                        new_items.append(item)
+                    else:
+                        changed = True
+                if changed:
+                    embed_data[header] = new_items
+                    modified = True
+
+            if modified:
+                with open(embed_path, 'w', encoding='utf-8') as f:
+                    json.dump(embed_data, f, ensure_ascii=False, indent=2)
+
+        else:
+            logger.logging(f"Файл не найден: {embed_path}")
     def add_qa_to_header(self, header, question, answer, output_file):
         """Добавляет вопрос и ответ в указанный заголовок в выходном JSON"""
         if os.path.exists(output_file):
@@ -236,9 +325,9 @@ class EmbeddingTools:
 
         return embeddings_dataset
 
-    def search_similar_questions(self, query, embeddings_dataset, top_k=3, timeout=60):
+    def search_similar_questions(self, query, embeddings_dataset, top_k=3):
         """Поиск наиболее похожих вопросов в данных нескольких JSON"""
-        query_embedding = np.array(self.get_embedding(query, timeout=timeout))
+        query_embedding = np.array(self.get_embedding(query, max_retries=20))
 
         results = []
 
@@ -263,7 +352,7 @@ class EmbeddingTools:
                         "header": header,
                         "question": qa["question"],
                         "answer": qa["answer"],
-                        "similarity": similarity,
+                        "similarity": similarity + (header_similarity / 2),
                         "header_similarity": header_similarity,
                         "question_similarity": question_similarity,
                         "answer_similarity": answer_similarity
@@ -272,41 +361,103 @@ class EmbeddingTools:
         results.sort(key=lambda x: x["similarity"], reverse=True)
         return results[:top_k]
 
-    def get_memories(self, query, specific_files=None, min_results=1, max_results=10, timeout=5):
-        try:
-            embeddings_dataset = self.get_embeddings_dataset(specific_files)
-            output_result = "# Память персонажа\n"
-            found_results = 0
-            similar_items = self.search_similar_questions(query, embeddings_dataset, top_k=max_results, timeout=timeout)
-            for i, item in enumerate(similar_items, 1):
-                if item['similarity'] > 0.75 or found_results < min_results:
-                    found_results += 1
-                    output_result += f"## Результат {i}\n"
-                    output_result += f"### Информация о '{item['json_name'][:-5]}'\n"
-                    output_result += f"#### Тема: {item['header']}\n"
-                    output_result += f"Вопрос: {item['question']}\n"
-                    output_result += f"Ответ: {item['answer']}\n"
-                    output_result += f"Схожесть вопроса с текущим: {item['similarity']:.3f}\n"
-            return output_result
-        except Exception as e:
-            logger.logging(f"ERROR: Не удалось выполнить get_memories: {e}")
+    def get_memories(
+            self,
+            query,
+            specific_files=None,
+            min_results=1,
+            max_results=5,
+            deepsearch=False,
+            file_path=None,
+            formatted_chat_history=""
+    ):
+        search_prompts = []
+        if deepsearch:
+            if not self.network_client:
+                logger.logging("Не указан network_client. Нельзя делать DeepSearch")
+                return ""
+            if formatted_chat_history:
+                formatted_chat_history = f"# История сообщения\n{formatted_chat_history}\n\n"
+            answer_gpt = self.network_client.chatgpt_api(
+                f"{search_dataset_prompt}\n\n{formatted_chat_history}\n\n# Текущий запрос\n{query}",
+                model=search_dataset_model,
+                file_path=file_path
+            )
+            converted, json_answer = convert_answer_to_json(
+                answer_gpt.response.text,
+                end_symbol="]",
+                start_symbol="[",
+                keys=[]
+            )
+            if not converted:
+                logger.logging(f"Не конвертировался ответ: {json_answer}")
+                search_prompts.append(query)
+            else:
+                search_prompts = json_answer
+        else:
+            search_prompts.append(query)
+
+        all_similar_items = []
+        questions_was = []
+
+        for search_prompt in search_prompts:
+            try:
+                embeddings_dataset = self.get_embeddings_dataset(specific_files)
+                similar_items = self.search_similar_questions(search_prompt, embeddings_dataset, top_k=100)
+
+                for item in similar_items:
+                    if item['question'] not in questions_was:
+                        all_similar_items.append(item)
+                        questions_was.append(item['question'])
+
+            except Exception as e:
+                logger.logging(f"ERROR: Не удалось выполнить get_memories: {e}")
+
+        # Сортировка по убыванию схожести и обрезка до max_results
+        all_similar_items = sorted(all_similar_items, key=lambda x: x['similarity'], reverse=True)[:max_results]
+
+        # Сортировка обратно по возрастанию для вывода
+        all_similar_items = sorted(all_similar_items, key=lambda x: x['similarity'])
+
+        all_similar_items = [item for item in all_similar_items if item['similarity'] > 0.80]
+
+        if not all_similar_items:
             return ""
+
+        output_result = "# Память персонажа\n"
+        last_info = ""
+        for item in all_similar_items:
+            result_this = ""
+            info_str = f"### Информация о '{item['json_name'][:-5]}'\n"
+            if info_str != last_info:
+                result_this += info_str
+                last_info = info_str
+
+            result_this += f"#### Тема: {item['header']}\n"
+            result_this += f"Вопрос: {item['question']}\n"
+            result_this += f"Ответ: {item['answer']}\n"
+            result_this += f"Схожесть вопроса с текущим: {item['similarity']:.2f}\n"
+            output_result += result_this
+
+        return output_result
 
 
 # Пример использования
 if __name__ == "__main__":
     # Инициализация
-    cohere_api_key = secret.cohere_api_key  # (бесплатно) https://huggingface.co/settings/tokens
+    cohere_api_keys = secret.cohere_api_keys
     dataset_folder = "dataset"  # Укажите путь к корневой папке
-    tools = EmbeddingTools(cohere_api_key, dataset_folder)
+    tools = EmbeddingTools(cohere_api_keys, dataset_folder)
 
     # Обработка папки dataset_json и сохранение в dataset_embeddings
     tools.process_folder()
     print("Processing complete")
 
-    prompt = "Какую игру ты делаешь?"
+    prompt = "Кто такой ...?"
     result = tools.get_memories(prompt)
     print(result)
+
+    tools.remove_question_from_header("FILE.json", question_text="TEXT")
 
     # # Добавление нового вопроса и ответа в конкретный файл
     # output_file = os.path.join(tools.dataset_embeddings_folder, "file1.json")

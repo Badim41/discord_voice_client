@@ -2,11 +2,13 @@ import os
 import queue
 import threading
 import time
-import numpy as np
 
-import sounddevice as sd
-import soundfile as sf
-from transliterate import translit
+try:
+    import sounddevice as sd
+    import soundfile as sf
+    from transliterate import translit
+except Exception as e:
+    print(f"Cant import one of: sounddevice, soundfile, transliterate. TTS module wont work. Error: {e}")
 
 from base_classes import network_client, sql_database
 import secret
@@ -37,7 +39,7 @@ class TTSQueue:
         while cls._running:
             try:
                 audio_file, creation_time = cls._queue.get(timeout=1)
-                logger.logging(f"got audio_file: {audio_file}, created at: {creation_time}")
+                # logger.logging(f"got audio_file: {audio_file}, created at: {creation_time}")
 
                 time_stop_playing = float(sql_database.get('time_stop_playing', 0))
                 if time_stop_playing > creation_time:
@@ -78,33 +80,19 @@ class TTSQueue:
 
     @staticmethod
     def play_sound_v2(mp3_filepath, creation_time):
-        logger.logging("got mp3_filepath", mp3_filepath)
-
-        def apply_fadeout(data, fade_samples=4410):  # 0.1 сек при 44100 Hz
-            fade = np.linspace(1.0, 0.0, fade_samples)
-            data[-fade_samples:] *= fade
-            return data
-
+        # logger.logging("got mp3_filepath", mp3_filepath)
         def play_sound_wrapped(device_index):
             nonlocal data
             time_stop_playing = float(sql_database.get('time_stop_playing', 0))
             if time_stop_playing > creation_time:
-                logger.logging("Stop play 1")
+                logger.logging(">> Пропуск аудио")
                 return
 
             stream = sd.play(data, samplerate, device=device_index)
             while sd.get_stream().active:
                 time_stop_playing = float(sql_database.get('time_stop_playing', 0))
                 if time_stop_playing > creation_time:
-                    logger.logging("Stop play 2 with fade-out")
-                    # Применяем fade-out к последним 0.1 секундам
-                    current_position = sd.get_stream().time * samplerate
-                    remaining_samples = len(data) - int(current_position)
-                    fade_samples = min(4410, remaining_samples)  # Не более оставшихся семплов
-                    if fade_samples > 0:
-                        fade = np.linspace(1.0, 0.0, fade_samples)
-                        data[-fade_samples:] *= fade
-                    time.sleep(0.1)  # Даем время на затухание
+                    logger.logging(">> Остановлено аудио")
                     sd.stop()
                     return
                 time.sleep(0.1)
@@ -122,22 +110,32 @@ class TTSQueue:
             thread.join()
 
 
-def tts_audio_with_play(text: str, speed, lang, voice_id, model_id):
+def tts_audio_with_play(text: str, speed, lang, voice_id, model_id, stop_event):
     logger.logging("Request to play")
+    sql_database['time_stop_playing'] = time.time() - 1
     time_play_start = time.time()
+
+    # Поправляем произношение
+    text = text.lower()
+    while text.count("хмм"):
+        text = text.replace("хмм", "хм")
 
     if translit_lang:
         text = translit(text, translit_lang)
 
     model = "hailuo"
+
     for audio_file, status in network_client.tts_api(
-            prompt=text.lower(),
+            prompt=text.replace("хм", "hmmmm"),
             model=model,
             speed=speed,
             lang=lang,
             voice_id=voice_id,
             model_id=model_id
     ):
+        if stop_event and stop_event.is_set():
+            print("Thread interrupted after TTS")
+            return
         time_stop_playing = float(sql_database.get('time_stop_playing', 0))
         if time_stop_playing > time_play_start:
             logger.logging("skip tts")
