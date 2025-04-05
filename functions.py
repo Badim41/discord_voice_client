@@ -29,7 +29,7 @@ def format_messages(
 
     # Обрабатываем сообщения в обратном порядке для приоритета новым,
     # но потом развернем для сохранения исходного порядка
-    messages = list(reversed(messages))[-max_length_history_messages:]
+    messages = list(reversed(messages[-max_length_history_messages:]))
     for message in messages:
         role = message.get('role', '')
         content = message.get('content', '')
@@ -45,7 +45,7 @@ def format_messages(
             content_str = str(content) + "\n"
 
         # Формируем сообщение без лишних префиксов для строк контента
-        formatted_message = f"{role}: {content_str.strip()}\n"
+        formatted_message = f"## {role}:\n{content_str.strip()}\n"
 
         # Проверяем длину с учетом max_length
         if max_length is not None:
