@@ -20,9 +20,11 @@ system_prompt = secret.system_prompt
 answer_json_examples = secret.answer_json_examples
 answer_json_format = secret.answer_json_format
 character_name = secret.character_name
+trigger_names = secret.trigger_names
 
 chat_gpt_model = secret.chat_gpt_model
 internet_access = secret.internet_access
+max_results_deepsearch = secret.max_results_deepsearch
 
 reply_on_every_message = secret.reply_on_every_message
 handling_chat_ids = secret.handling_chat_ids
@@ -148,11 +150,12 @@ async def on_message_thread(message: DiscordMessage):
         return
 
     chat_history = sql_database_discord.get(chat_history_key, [])
-
     # Проверка упоминаний
-    user_ping = False
+    mention_ids = [mention["id"] for mention in message.mentions]
+    user_ping = discord_client.info.user_id in mention_ids
+    print("message.mentions", message.mentions, user_ping)
     if message.referenced_message:
-        user_ping = discord_client.info.user_id == message.referenced_message.author.id
+        user_ping = user_ping or discord_client.info.user_id == message.referenced_message.author.id
     # mention_here = message.mention_everyone
     name_mention = any(
         obj.lower() in text.lower() for obj in [
@@ -160,7 +163,7 @@ async def on_message_thread(message: DiscordMessage):
             discord_client.info.username,
             discord_client.info.user_id,
             character_name
-        ]
+        ] + trigger_names
     )
 
     if user_ping or name_mention or reply_on_every_message or not message.guild_id:
@@ -184,17 +187,22 @@ async def on_message_thread(message: DiscordMessage):
                 image_input = await asyncio.to_thread(download_image_path_from_message, message)
                 print("img input", image_input)
 
+                memories_character = ""  # значение по умолчанию
                 try:
-                    memories_character = embedding_tools.get_memories(
-                        text,
-                        deepsearch=True,
-                        file_path=image_input,
-                        formatted_chat_history=formatted_chat_history,
-                        max_results=10
+                    memories_character = await asyncio.wait_for(
+                        asyncio.to_thread(embedding_tools.get_memories,
+                                          text,
+                                          deepsearch=True,
+                                          file_path=image_input,
+                                          formatted_chat_history=formatted_chat_history,
+                                          max_results=max_results_deepsearch
+                                          ),
+                        timeout=60.0  #  время в секундах
                     )
+                except asyncio.TimeoutError:
+                    logger.logging("memories_character - timed out")
                 except Exception as e:
                     logger.logging(f"Error in memories_character: {e}")
-                    memories_character = ""
 
                 prompt_words = str(text).count(" ")
                 if image_input:
@@ -241,7 +249,7 @@ async def on_message_thread(message: DiscordMessage):
 
                 # Обработка JSON-ответа
                 for n_action, action in enumerate(json_answer):
-                    if action.get("event_type") == "write":
+                    if action.get("event_type") != "reaction": # todo Если будут другие события
                         # Отправка сообщения
 
                         # Найти кому ответить
@@ -282,7 +290,7 @@ async def on_message_thread(message: DiscordMessage):
                                             chat_id=message.channel_id,
                                             text=message_text + f"[̤̮]({image_group[0]})"
                                         )
-                        else:
+                        elif message_text.strip():
                             # Отправка текстового сообщения
                             try:  # если история чата скрыта, будет ошибка
                                 await discord_client.send_message(

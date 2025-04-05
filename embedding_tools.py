@@ -116,7 +116,7 @@ class EmbeddingTools:
                     raise Exception("All Cohere API keys exhausted")
 
             api_key = current_keys[0]
-            print(f"use: {api_key}")
+            # print(f"use: {api_key}")
             headers = {**headers_template, "Authorization": f"bearer {api_key}"}
 
             try:
@@ -361,6 +361,14 @@ class EmbeddingTools:
         results.sort(key=lambda x: x["similarity"], reverse=True)
         return results[:top_k]
 
+    def _process_prompt(self, prompt, embeddings_dataset):
+        """Обработка одного промпта"""
+        try:
+            return self.search_similar_questions(prompt, embeddings_dataset, top_k=100)
+        except Exception as e:
+            logger.logging(f"ERROR processing prompt '{prompt}': {e}")
+            return []
+
     def get_memories(
             self,
             query,
@@ -394,36 +402,43 @@ class EmbeddingTools:
                 search_prompts.append(query)
             else:
                 search_prompts = json_answer
-        else:
-            search_prompts.append(query)
+
+        search_prompts.append(query)
 
         all_similar_items = []
-        questions_was = []
+        questions_was = set()  # Используем set для более быстрой проверки уникальности
 
-        for search_prompt in search_prompts:
-            try:
-                embeddings_dataset = self.get_embeddings_dataset(specific_files)
-                similar_items = self.search_similar_questions(search_prompt, embeddings_dataset, top_k=100)
+        # Получаем embeddings_dataset один раз перед параллельной обработкой
+        embeddings_dataset = self.get_embeddings_dataset(specific_files)
 
-                for item in similar_items:
-                    if item['question'] not in questions_was:
-                        all_similar_items.append(item)
-                        questions_was.append(item['question'])
+        # Параллельная обработка всех промптов
+        with ThreadPoolExecutor() as executor:
+            # Запускаем обработку всех промптов параллельно
+            future_to_prompt = {
+                executor.submit(self._process_prompt, prompt, embeddings_dataset): prompt
+                for prompt in search_prompts
+            }
 
-            except Exception as e:
-                logger.logging(f"ERROR: Не удалось выполнить get_memories: {e}")
+            # Собираем результаты по мере их готовности
+            for future in future_to_prompt:
+                try:
+                    similar_items = future.result()
+                    for item in similar_items:
+                        if item['question'] not in questions_was:
+                            all_similar_items.append(item)
+                            questions_was.add(item['question'])
+                except Exception as e:
+                    logger.logging(f"ERROR in future result: {e}")
 
-        # Сортировка по убыванию схожести и обрезка до max_results
+        # Сортировка и фильтрация результатов
         all_similar_items = sorted(all_similar_items, key=lambda x: x['similarity'], reverse=True)[:max_results]
-
-        # Сортировка обратно по возрастанию для вывода
         all_similar_items = sorted(all_similar_items, key=lambda x: x['similarity'])
-
         all_similar_items = [item for item in all_similar_items if item['similarity'] > 0.80]
 
         if not all_similar_items:
             return ""
 
+        # Формирование вывода
         output_result = "# Память персонажа\n"
         last_info = ""
         for item in all_similar_items:
